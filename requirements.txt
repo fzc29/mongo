@@ -1,0 +1,14 @@
+anthropic
+bcrypt
+certifi
+langchain
+langchain_community
+langchain_core
+langchain_google_genai
+langchain_mongodb
+langchain_openai
+langchain_text_splitters
+pymongo[srv]
+pypdf
+python-dotenv
+streamlit
