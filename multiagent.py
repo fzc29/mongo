@@ -86,23 +86,11 @@ class MarketContextAgent(BaseAgent):
             self.embedding,
         )
 
-    def _detect_time_filter(self, question: str):
-        """
-        Detects month and year references in a query and returns
-        a MongoDB pre_filter dict or None if nothing detected.
 
-        Handles:
-        - Full month names: "February", "february"
-        - Abbreviations: "Feb", "feb"
-        - Abbreviated with period: "Feb."
-        - Numeric format: "2/2026", "02/2026"
-        - Quarter references: "Q1 2026", "q1"
-        - Year only: "2026"
-        """
+    def _detect_time_filter(self, question: str):
         import re
         question_lower = question.lower()
 
-        # ── Month name + abbreviation map ──────────────────
         month_map = {
             "january":   "january",  "jan":  "january",
             "february":  "february", "feb":  "february",
@@ -118,7 +106,6 @@ class MarketContextAgent(BaseAgent):
             "december":  "december", "dec":  "december",
         }
 
-        # ── Quarter map ────────────────────────────────────
         quarter_map = {
             "q1": ["january", "february", "march"],
             "q2": ["april", "may", "june"],
@@ -126,7 +113,6 @@ class MarketContextAgent(BaseAgent):
             "q4": ["october", "november", "december"],
         }
 
-        # ── Numeric month map ──────────────────────────────
         numeric_month_map = {
             "1": "january",  "2": "february", "3": "march",
             "4": "april",    "5": "may",       "6": "june",
@@ -138,18 +124,18 @@ class MarketContextAgent(BaseAgent):
         found_year = None
         quarter_months = None
 
-        # ── Step 1: Detect year ────────────────────────────
+        # Step 1 — detect year
         year_match = re.search(r"\b(202[0-9])\b", question)
         if year_match:
             found_year = year_match.group(1)
 
-        # ── Step 2: Detect full month name or abbreviation ─
+        # Step 2 — full month name or abbreviation
         for key, value in month_map.items():
             if re.search(rf"\b{key}\b", question_lower):
                 found_month = value
                 break
 
-        # ── Step 3: Detect abbreviation with period e.g. "Feb." ──
+        # Step 3 — abbreviation with period e.g. "Feb."
         if not found_month:
             abbrev_match = re.search(
                 r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.",
@@ -158,108 +144,84 @@ class MarketContextAgent(BaseAgent):
             if abbrev_match:
                 found_month = month_map.get(abbrev_match.group(1))
 
-        # ── Step 4: Detect numeric format e.g. "2/2026" ───
+        # Step 4 — numeric format e.g. "2/2026"
         if not found_month:
-            numeric_match = re.search(
-                r"\b(0?[1-9]|1[0-2])/(202[0-9])\b", question
-            )
+            numeric_match = re.search(r"\b(0?[1-9]|1[0-2])/(202[0-9])\b", question)
             if numeric_match:
                 month_num = numeric_match.group(1).lstrip("0")
                 found_month = numeric_month_map.get(month_num)
                 if not found_year:
                     found_year = numeric_match.group(2)
 
-        # ── Step 5: Detect quarter e.g. "Q1 2026" ─────────
+        # Step 5 — quarter reference
         if not found_month:
             for quarter, months in quarter_map.items():
                 if re.search(rf"\b{quarter}\b", question_lower):
                     quarter_months = months
                     break
 
-        # ── Step 6: Build pre_filter ───────────────────────
-
-        # Quarter filter
-        if quarter_months:
-            month_conditions = [
-                {"metadata.original_filename": {
-                    "$regex": m, "$options": "i"
-                }}
-                for m in quarter_months
-            ]
-            if found_year:
-                return {
-                    "$and": [
-                        {"$or": month_conditions},
-                        {"metadata.original_filename": {
-                            "$regex": found_year, "$options": "i"
-                        }}
-                    ]
-                }
-            return {"$or": month_conditions}
-
-        # Month + year filter (most precise)
-        if found_month and found_year:
-            return {
-                "$and": [
-                    {"metadata.original_filename": {
-                        "$regex": found_month, "$options": "i"
-                    }},
-                    {"metadata.original_filename": {
-                        "$regex": found_year, "$options": "i"
-                    }},
-                ]
-            }
-
-        # Month only
-        if found_month:
-            return {
-                "metadata.original_filename": {
-                    "$regex": found_month, "$options": "i"
-                }
-            }
-
-        # Year only
-        if found_year:
-            return {
-                "metadata.original_filename": {
-                    "$regex": found_year, "$options": "i"
-                }
-            }
-
-        # No time reference detected
-        return None
+        return found_month, found_year, quarter_months
 
     def analyze(self, question: str) -> Dict[str, Any]:
-        pre_filter = self._detect_time_filter(question)
+        found_month, found_year, quarter_months = self._detect_time_filter(question)
 
-        if pre_filter:
-            docs = self.context_store.similarity_search(
-                question,
-                k=self.context_k,
-                pre_filter=pre_filter,
-            )
-            # Fall back to full search if filter returns too few results
-            if len(docs) < 5:
-                docs = self.context_store.similarity_search(
-                    question, k=self.context_k
+        # Always do full vector search first
+        # Fetch more docs than needed so we have room to filter
+        docs = self.context_store.similarity_search(
+            question, k=self.context_k * 3
+        )
+
+        # Post-filter by filename if time reference detected
+        if found_month and found_year:
+            filtered = [
+                d for d in docs
+                if found_month.lower() in (d.metadata.get("original_filename") or "").lower()
+                and found_year in (d.metadata.get("original_filename") or "")
+            ]
+        elif quarter_months and found_year:
+            filtered = [
+                d for d in docs
+                if any(
+                    m in (d.metadata.get("original_filename") or "").lower()
+                    for m in quarter_months
                 )
+                and found_year in (d.metadata.get("original_filename") or "")
+            ]
+        elif found_month:
+            filtered = [
+                d for d in docs
+                if found_month.lower() in (d.metadata.get("original_filename") or "").lower()
+            ]
+        elif quarter_months:
+            filtered = [
+                d for d in docs
+                if any(
+                    m in (d.metadata.get("original_filename") or "").lower()
+                    for m in quarter_months
+                )
+            ]
+        elif found_year:
+            filtered = [
+                d for d in docs
+                if found_year in (d.metadata.get("original_filename") or "")
+            ]
         else:
-            docs = self.context_store.similarity_search(
-                question, k=self.context_k
-            )
+            filtered = docs
+
+        # Fall back to full results if filter leaves too few
+        final_docs = filtered if len(filtered) >= 5 else docs
 
         system_prompt = (
             "You are a macro market analyst. Extract key events and impacts "
-            "strictly from provided context. Match context with initial query, especially "
-            "by the dates relevant."
+            "strictly from provided context."
         )
 
         user_prompt = f"""
-Question: {question}
+    Question: {question}
 
-Context:
-{''.join(doc.page_content for doc in docs[:20])}
-"""
+    Context:
+    {''.join(doc.page_content for doc in final_docs[:20])}
+    """
 
         analysis = self._call_claude(system_prompt, user_prompt)
 
@@ -268,6 +230,7 @@ Context:
             "analysis": analysis,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
 
 # class MarketContextAgent(BaseAgent):
 #     def __init__(self, *args, **kwargs):
