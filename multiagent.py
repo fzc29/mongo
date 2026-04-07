@@ -82,7 +82,7 @@ class MarketContextAgent(BaseAgent):
         super().__init__(*args, **kwargs)
         self.context_store = get_vector_store(
             "context_vectors",
-            "vector_index_context",
+            "vector_index",
             self.embedding,
         )
 

@@ -70,7 +70,7 @@ def get_collection(collection_name: str):
 # ============================================================
 
 COLLECTIONS = {
-    "context":            ("context_vectors",   "vector_index_context"),
+    "context":            ("context_vectors",   "vector_index"),
     "pnl":                ("pnl_vectors",        "vector_index"),
     "newsletter":         ("newsletter_vectors", "vector_index"),
     "weekly_market_data": ("weekly_vectors",     "vector_index"),
