@@ -334,17 +334,26 @@ with tab1:
     st.subheader("Upload & Index Documents")
     st.markdown("Documents indexed here are immediately available to all users.")
 
-    uploaded_files = st.file_uploader(
-        "Upload Doc (PDF, Markdown, CSV)",
-        type=["pdf", "md", "csv"],
-        accept_multiple_files=True,
-        key="uploader",
-    )
+    if "upload_category" not in st.session_state:
+        st.session_state.upload_category = None
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
 
     store_type = st.selectbox(
         "Select Knowledge Base",
         list(COLLECTIONS.keys()),
         key="upload_collection",
+    )
+
+    if st.session_state.upload_category != store_type:
+        st.session_state.upload_category = store_type
+        st.session_state.uploader_key += 1 
+
+    uploaded_files = st.file_uploader(
+        "Upload Doc (PDF, Markdown, CSV)",
+        type=["pdf", "md", "csv"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}",
     )
 
     collection_name, index_name = COLLECTIONS[store_type]
@@ -395,8 +404,11 @@ with tab1:
 
                     # Tag with original filename and uploader
                     for doc in docs:
+                        doc.metadata = doc.metadata or {} 
+                        doc.metadata["source"] = uploaded_file.name           # overwrite temp path
                         doc.metadata["original_filename"] = uploaded_file.name
                         doc.metadata["uploaded_by"] = st.session_state.username
+                        doc.metadata["collection"] = store_type
 
                     splitter = RecursiveCharacterTextSplitter(
                         chunk_size=1000, chunk_overlap=200

@@ -381,6 +381,8 @@ def list_sources(collection_name: str, silent=False) -> list[str]:
         values = collection.distinct(field)
         sources.update([v for v in values if v])
 
+    sources = {s for s in sources if not s.startswith("/tmp")}
+
     sources = sorted(sources)
 
     if not silent:
