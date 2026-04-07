@@ -80,19 +80,178 @@ class BaseAgent:
 class MarketContextAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # context_vectors uses a different index name — see build_index.py
         self.context_store = get_vector_store(
             "context_vectors",
             "vector_index_context",
             self.embedding,
         )
 
+    def _detect_time_filter(self, question: str):
+        """
+        Detects month and year references in a query and returns
+        a MongoDB pre_filter dict or None if nothing detected.
+
+        Handles:
+        - Full month names: "February", "february"
+        - Abbreviations: "Feb", "feb"
+        - Abbreviated with period: "Feb."
+        - Numeric format: "2/2026", "02/2026"
+        - Quarter references: "Q1 2026", "q1"
+        - Year only: "2026"
+        """
+        import re
+        question_lower = question.lower()
+
+        # ── Month name + abbreviation map ──────────────────
+        month_map = {
+            "january":   "january",  "jan":  "january",
+            "february":  "february", "feb":  "february",
+            "march":     "march",    "mar":  "march",
+            "april":     "april",    "apr":  "april",
+            "may":       "may",
+            "june":      "june",     "jun":  "june",
+            "july":      "july",     "jul":  "july",
+            "august":    "august",   "aug":  "august",
+            "september": "september","sep":  "september",
+            "october":   "october",  "oct":  "october",
+            "november":  "november", "nov":  "november",
+            "december":  "december", "dec":  "december",
+        }
+
+        # ── Quarter map ────────────────────────────────────
+        quarter_map = {
+            "q1": ["january", "february", "march"],
+            "q2": ["april", "may", "june"],
+            "q3": ["july", "august", "september"],
+            "q4": ["october", "november", "december"],
+        }
+
+        # ── Numeric month map ──────────────────────────────
+        numeric_month_map = {
+            "1": "january",  "2": "february", "3": "march",
+            "4": "april",    "5": "may",       "6": "june",
+            "7": "july",     "8": "august",    "9": "september",
+            "10": "october", "11": "november", "12": "december",
+        }
+
+        found_month = None
+        found_year = None
+        quarter_months = None
+
+        # ── Step 1: Detect year ────────────────────────────
+        year_match = re.search(r"\b(202[0-9])\b", question)
+        if year_match:
+            found_year = year_match.group(1)
+
+        # ── Step 2: Detect full month name or abbreviation ─
+        for key, value in month_map.items():
+            if re.search(rf"\b{key}\b", question_lower):
+                found_month = value
+                break
+
+        # ── Step 3: Detect abbreviation with period e.g. "Feb." ──
+        if not found_month:
+            abbrev_match = re.search(
+                r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.",
+                question_lower
+            )
+            if abbrev_match:
+                found_month = month_map.get(abbrev_match.group(1))
+
+        # ── Step 4: Detect numeric format e.g. "2/2026" ───
+        if not found_month:
+            numeric_match = re.search(
+                r"\b(0?[1-9]|1[0-2])/(202[0-9])\b", question
+            )
+            if numeric_match:
+                month_num = numeric_match.group(1).lstrip("0")
+                found_month = numeric_month_map.get(month_num)
+                if not found_year:
+                    found_year = numeric_match.group(2)
+
+        # ── Step 5: Detect quarter e.g. "Q1 2026" ─────────
+        if not found_month:
+            for quarter, months in quarter_map.items():
+                if re.search(rf"\b{quarter}\b", question_lower):
+                    quarter_months = months
+                    break
+
+        # ── Step 6: Build pre_filter ───────────────────────
+
+        # Quarter filter
+        if quarter_months:
+            month_conditions = [
+                {"metadata.original_filename": {
+                    "$regex": m, "$options": "i"
+                }}
+                for m in quarter_months
+            ]
+            if found_year:
+                return {
+                    "$and": [
+                        {"$or": month_conditions},
+                        {"metadata.original_filename": {
+                            "$regex": found_year, "$options": "i"
+                        }}
+                    ]
+                }
+            return {"$or": month_conditions}
+
+        # Month + year filter (most precise)
+        if found_month and found_year:
+            return {
+                "$and": [
+                    {"metadata.original_filename": {
+                        "$regex": found_month, "$options": "i"
+                    }},
+                    {"metadata.original_filename": {
+                        "$regex": found_year, "$options": "i"
+                    }},
+                ]
+            }
+
+        # Month only
+        if found_month:
+            return {
+                "metadata.original_filename": {
+                    "$regex": found_month, "$options": "i"
+                }
+            }
+
+        # Year only
+        if found_year:
+            return {
+                "metadata.original_filename": {
+                    "$regex": found_year, "$options": "i"
+                }
+            }
+
+        # No time reference detected
+        return None
+
     def analyze(self, question: str) -> Dict[str, Any]:
-        docs = self._search(self.context_store, question, k=self.context_k)
+        pre_filter = self._detect_time_filter(question)
+
+        if pre_filter:
+            docs = self.context_store.similarity_search(
+                question,
+                k=self.context_k,
+                pre_filter=pre_filter,
+            )
+            # Fall back to full search if filter returns too few results
+            if len(docs) < 5:
+                docs = self.context_store.similarity_search(
+                    question, k=self.context_k
+                )
+        else:
+            docs = self.context_store.similarity_search(
+                question, k=self.context_k
+            )
 
         system_prompt = (
             "You are a macro market analyst. Extract key events and impacts "
-            "strictly from provided context."
+            "strictly from provided context. Match context with initial query, especially "
+            "by the dates relevant."
         )
 
         user_prompt = f"""
@@ -109,6 +268,39 @@ Context:
             "analysis": analysis,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+# class MarketContextAgent(BaseAgent):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         # context_vectors uses a different index name — see build_index.py
+#         self.context_store = get_vector_store(
+#             "context_vectors",
+#             "vector_index_context",
+#             self.embedding,
+#         )
+
+#     def analyze(self, question: str) -> Dict[str, Any]:
+#         docs = self._search(self.context_store, question, k=self.context_k)
+
+#         system_prompt = (
+#             "You are a macro market analyst. Extract key events and impacts "
+#             "strictly from provided context."
+#         )
+
+#         user_prompt = f"""
+# Question: {question}
+
+# Context:
+# {''.join(doc.page_content for doc in docs[:20])}
+# """
+
+#         analysis = self._call_claude(system_prompt, user_prompt)
+
+#         return {
+#             "agent": "MarketContextAgent",
+#             "analysis": analysis,
+#             "timestamp": datetime.now(timezone.utc).isoformat(),
+#         }
 
 
 # ============================================================
