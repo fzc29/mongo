@@ -1,8 +1,14 @@
+import re
 import streamlit as st
 import asyncio
 import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system
+
+
+def safe_md(text: str) -> str:
+    """Escape bare dollar signs so Streamlit doesn't render them as LaTeX."""
+    return re.sub(r'\$(?=[\d\s(])', r'\\$', text)
 
 load_dotenv()
 
@@ -359,19 +365,31 @@ if st.session_state.history:
     st.divider()
 
     st.subheader("Generated Newsletter")
-    st.markdown(latest["result"]["newsletter"]["newsletter"])
+    st.markdown(safe_md(latest["result"]["newsletter"]["newsletter"]))
 
     with st.expander("View Market Context Analysis"):
-        st.markdown(latest["result"]["market"]["analysis"])
+        st.markdown(safe_md(latest["result"]["market"]["analysis"]))
 
     with st.expander("View Portfolio Performance Analysis"):
-        st.markdown(latest["result"]["performance"]["analysis"])
+        st.markdown(safe_md(latest["result"]["performance"]["analysis"]))
 
     with st.expander("View Risk Analysis"):
-        st.markdown(latest["result"]["risk"]["analysis"])
+        st.markdown(safe_md(latest["result"]["risk"]["analysis"]))
 
     with st.expander("View Weekly Market Data Analysis"):
-        st.markdown(latest["result"]["weekly"]["analysis"])
+        st.markdown(safe_md(latest["result"]["weekly"]["analysis"]))
+
+    # Debug: critique logs — hidden unless admin or debug mode
+    if st.session_state.get("role") == "admin":
+        with st.expander("Debug: Self-Critique Logs", expanded=False):
+            for agent_key, label in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
+                logs = latest["result"][agent_key].get("critique_log", [])
+                if logs:
+                    st.markdown(f"**{label}** — {len(logs)} critique round(s)")
+                    for i, log in enumerate(logs):
+                        st.markdown(f"Round {i+1}: `{log[:200]}{'...' if len(log) > 200 else ''}`")
+                else:
+                    st.markdown(f"**{label}** — no critique log")
 
     # ── Session history — previous queries this session ────
     if len(st.session_state.history) > 1:
@@ -382,13 +400,13 @@ if st.session_state.history:
         )
         for item in reversed(st.session_state.history[:-1]):
             with st.expander(item["query"][:80]):
-                st.markdown(item["result"]["newsletter"]["newsletter"])
+                st.markdown(safe_md(item["result"]["newsletter"]["newsletter"]))
 
                 with st.expander("Market Context"):
-                    st.markdown(item["result"]["market"]["analysis"])
+                    st.markdown(safe_md(item["result"]["market"]["analysis"]))
                 with st.expander("Portfolio Performance"):
-                    st.markdown(item["result"]["performance"]["analysis"])
+                    st.markdown(safe_md(item["result"]["performance"]["analysis"]))
                 with st.expander("Risk Analysis"):
-                    st.markdown(item["result"]["risk"]["analysis"])
+                    st.markdown(safe_md(item["result"]["risk"]["analysis"]))
                 with st.expander("Weekly Market Data"):
-                    st.markdown(item["result"]["weekly"]["analysis"])
+                    st.markdown(safe_md(item["result"]["weekly"]["analysis"]))

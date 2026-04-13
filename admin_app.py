@@ -22,6 +22,9 @@ from build import (
     get_collection,
     embedding,
     COLLECTIONS,
+    ingest_pnl_structured,
+    delete_pnl_period,
+    list_pnl_periods,
 )
 
 from auth_helper import verify_login, is_authenticated, is_admin
@@ -315,7 +318,7 @@ st.divider()
 # Tabs
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Upload & Index",
     "Delete Documents",
     "Deduplicate",
@@ -323,6 +326,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Database Stats",
     "Verify Embeddings",
     "User Management",
+    "PnL Periods",
 ])
 
 
@@ -357,7 +361,14 @@ with tab1:
     )
 
     collection_name, index_name = COLLECTIONS[store_type]
-    st.info(f"Files will be added to **{collection_name}**.")
+
+    if store_type == "pnl":
+        st.info(
+            "PnL files are stored as structured rows in `pnl_table` (no vector embedding). "
+            "Period is auto-detected from the filename — confirm or override below before indexing."
+        )
+    else:
+        st.info(f"Files will be added to **{collection_name}**.")
 
     upload_mode = st.radio(
         "Upload mode",
@@ -366,80 +377,113 @@ with tab1:
         key="upload_mode",
     )
 
-    if uploaded_files and st.button("Index Document", key="btn_upload"):
-        all_chunks = []
-        errors = []
-
-        with st.spinner("Processing and embedding..."):
-            for uploaded_file in uploaded_files:
-                suffix = Path(uploaded_file.name).suffix
-
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(uploaded_file.getbuffer())
-                    temp_path = Path(tmp.name)
-
-                try:
-                    # If reindex mode, remove existing chunks first
-                    if "Reindex" in upload_mode:
-                        deleted = delete_by_source(
-                            uploaded_file.name, collection_name
-                        )
-                        if deleted:
-                            st.write(
-                                f"Removed {deleted} existing chunks "
-                                f"for `{uploaded_file.name}`"
-                            )
-
-                    # Load file
-                    ext = temp_path.suffix.lower()
-                    if ext == ".pdf":
-                        docs = PyPDFLoader(str(temp_path)).load()
-                    elif ext == ".md":
-                        text = temp_path.read_text(encoding="utf-8")
-                        docs = [Document(page_content=text, metadata={"source": uploaded_file.name})]
-                    elif ext == ".csv":
-                        docs = CSVLoader(str(temp_path)).load()
-                    else:
-                        raise ValueError(f"Unsupported file type: {ext}")
-
-                    # Tag with original filename and uploader
-                    for doc in docs:
-                        doc.metadata = doc.metadata or {} 
-                        doc.metadata["source"] = uploaded_file.name           # overwrite temp path
-                        doc.metadata["original_filename"] = uploaded_file.name
-                        doc.metadata["uploaded_by"] = st.session_state.username
-                        doc.metadata["collection"] = store_type
-
-                    splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000, chunk_overlap=200
-                    )
-                    chunks = splitter.split_documents(docs)
-                    all_chunks.extend(chunks)
-                    st.write(f"`{uploaded_file.name}` — {len(chunks)} chunks")
-
-                except Exception as e:
-                    errors.append(f"{uploaded_file.name}: {str(e)}")
-                    st.warning(f"Error: `{uploaded_file.name}` — {str(e)}")
-
-                finally:
-                    temp_path.unlink(missing_ok=True)
-
-            if all_chunks:
-                MongoDBAtlasVectorSearch.from_documents(
-                    documents=all_chunks,
-                    embedding=embedding,
-                    collection=get_collection(collection_name),
-                    index_name=index_name,
-                )
-                st.info(f"Written to **{collection_name}** in MongoDB.")
-
-        if all_chunks:
-            st.success(
-                f"{len(all_chunks)} chunks indexed into `{store_type}`. "
-                f"All users can access this data immediately."
+    # PnL: show period preview + override field before indexing
+    if store_type == "pnl" and uploaded_files:
+        from build import _extract_report_period
+        st.markdown("**Confirm reporting periods:**")
+        period_overrides = {}
+        for uf in uploaded_files:
+            detected = _extract_report_period(uf.name)
+            override = st.text_input(
+                f"{uf.name}",
+                value=detected,
+                help="Format: YYYY-MM. Edit if the auto-detected period is wrong.",
+                key=f"period_{uf.name}",
             )
-        if errors:
-            st.error(f"Failed: {', '.join(errors)}")
+            period_overrides[uf.name] = override.strip()
+
+    if uploaded_files and st.button("Index Document", key="btn_upload"):
+
+        # ── PnL: structured row storage (no vector embedding) ──────────
+        if store_type == "pnl":
+            with st.spinner("Parsing and storing PnL data..."):
+                for uploaded_file in uploaded_files:
+                    suffix = Path(uploaded_file.name).suffix
+                    confirmed_period = period_overrides.get(uploaded_file.name)
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(uploaded_file.getbuffer())
+                        temp_path = Path(tmp.name)
+                    try:
+                        if "Reindex" in upload_mode:
+                            deleted = delete_pnl_period(confirmed_period)
+                            if deleted:
+                                st.write(f"Removed {deleted} existing rows for period `{confirmed_period}`")
+
+                        n = ingest_pnl_structured(
+                            temp_path,
+                            report_period=confirmed_period,
+                            source_name=uploaded_file.name,
+                            uploaded_by=st.session_state.username,
+                        )
+                        if n:
+                            st.success(f"`{uploaded_file.name}` — {n} rows stored as period `{confirmed_period}`")
+                        else:
+                            st.warning(f"`{uploaded_file.name}` — no rows ingested (period `{confirmed_period}` may already exist)")
+                    except Exception as e:
+                        st.error(f"`{uploaded_file.name}`: {e}")
+                    finally:
+                        temp_path.unlink(missing_ok=True)
+
+        # ── All other categories: vector embedding ──────────────────────
+        else:
+            all_chunks = []
+            errors = []
+
+            with st.spinner("Processing and embedding..."):
+                for uploaded_file in uploaded_files:
+                    suffix = Path(uploaded_file.name).suffix
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(uploaded_file.getbuffer())
+                        temp_path = Path(tmp.name)
+
+                    try:
+                        if "Reindex" in upload_mode:
+                            deleted = delete_by_source(uploaded_file.name, collection_name)
+                            if deleted:
+                                st.write(f"Removed {deleted} existing chunks for `{uploaded_file.name}`")
+
+                        ext = temp_path.suffix.lower()
+                        if ext == ".pdf":
+                            docs = PyPDFLoader(str(temp_path)).load()
+                        elif ext == ".md":
+                            text = temp_path.read_text(encoding="utf-8")
+                            docs = [Document(page_content=text, metadata={"source": uploaded_file.name})]
+                        elif ext == ".csv":
+                            docs = CSVLoader(str(temp_path)).load()
+                        else:
+                            raise ValueError(f"Unsupported file type: {ext}")
+
+                        for doc in docs:
+                            doc.metadata = doc.metadata or {}
+                            doc.metadata["source"] = uploaded_file.name
+                            doc.metadata["original_filename"] = uploaded_file.name
+                            doc.metadata["uploaded_by"] = st.session_state.username
+                            doc.metadata["collection"] = store_type
+
+                        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                        chunks = splitter.split_documents(docs)
+                        all_chunks.extend(chunks)
+                        st.write(f"`{uploaded_file.name}` — {len(chunks)} chunks")
+
+                    except Exception as e:
+                        errors.append(f"{uploaded_file.name}: {str(e)}")
+                        st.warning(f"Error: `{uploaded_file.name}` — {str(e)}")
+                    finally:
+                        temp_path.unlink(missing_ok=True)
+
+                if all_chunks:
+                    MongoDBAtlasVectorSearch.from_documents(
+                        documents=all_chunks,
+                        embedding=embedding,
+                        collection=get_collection(collection_name),
+                        index_name=index_name,
+                    )
+                    st.success(
+                        f"{len(all_chunks)} chunks indexed into `{store_type}`. "
+                        "All users can access this data immediately."
+                    )
+                if errors:
+                    st.error(f"Failed: {', '.join(errors)}")
 
 
 # ============================================================
@@ -723,3 +767,59 @@ with tab7:
                         delete_user(u["username"])
                         st.success(f"Removed {u['username']}")
                         st.rerun()
+
+
+# ============================================================
+# TAB 8 — PnL Periods
+# ============================================================
+
+with tab8:
+    st.subheader("PnL Periods")
+    st.markdown(
+        "Manage structured PnL data stored in `pnl_table`. "
+        "Each period corresponds to one uploaded monthly PnL file."
+    )
+
+    if st.button("Refresh Periods", key="btn_pnl_periods"):
+        col = get_collection("pnl_table")
+        periods = sorted(col.distinct("report_period"))
+
+        if not periods:
+            st.info("No PnL periods found in pnl_table.")
+        else:
+            st.markdown(f"**{len(periods)} period(s) loaded:**")
+            for p in periods:
+                count = col.count_documents({"report_period": p})
+                src_doc = col.find_one({"report_period": p}, {"source_file": 1, "uploaded_by": 1, "uploaded_at": 1})
+                src = (src_doc or {}).get("source_file", "?")
+                by  = (src_doc or {}).get("uploaded_by", "?")
+                st.markdown(
+                    f'<div class="stats-row">'
+                    f'<span class="stats-label">{p}</span>'
+                    f'<span style="font-family:\'Jost\',sans-serif;font-size:13px;color:#7a6e60;">'
+                    f'{count} positions · {src} · uploaded by {by}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.divider()
+    st.markdown("**Delete a Period**")
+    st.markdown("Removes all rows for the selected period so it can be re-uploaded.")
+
+    del_period_input = st.text_input(
+        "Period to delete (YYYY-MM)",
+        placeholder="e.g. 2026-02",
+        key="del_period_input",
+    )
+    dry_run_period = st.checkbox("Preview only (dry run)", value=True, key="pnl_del_dryrun")
+
+    if st.button("Delete Period", key="btn_del_period"):
+        if del_period_input.strip():
+            with st.spinner("Processing..."):
+                count = delete_pnl_period(del_period_input.strip(), dry_run=dry_run_period)
+            if dry_run_period:
+                st.info(f"Preview: {count} rows would be deleted for `{del_period_input}`. Uncheck preview to delete.")
+            else:
+                st.success(f"Deleted {count} rows for period `{del_period_input}`.")
+        else:
+            st.warning("Enter a period in YYYY-MM format.")
