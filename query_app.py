@@ -5,6 +5,9 @@ import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 
 def safe_md(text: str) -> str:
     """Escape bare dollar signs so Streamlit doesn't render them as LaTeX."""
@@ -327,9 +330,19 @@ if not is_authenticated(st.session_state):
 # Uses read-only MongoDB credentials via MONGO_URI in .env
 # ============================================================
 
+# @st.cache_resource
+# def get_orchestrator():
+#     return build_agent_system()
+
+# orchestrator = get_orchestrator()
+
 @st.cache_resource
 def get_orchestrator():
-    return build_agent_system()
+    try:
+        return build_agent_system()
+    except Exception as e:
+        st.error(f"Failed to initialize agent system: {e}")
+        st.stop()
 
 orchestrator = get_orchestrator()
 
