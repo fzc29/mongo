@@ -5,8 +5,12 @@ import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system
 
-import logging
-logging.basicConfig(level=logging.DEBUG)
+import streamlit as st
+st.write("APP STARTED")
+st.write("MONGO_URI_USER:", os.getenv("MONGO_URI_USER") is not None)
+st.write("MONGO_URI_ADMIN:", os.getenv("MONGO_URI_ADMIN") is not None)
+st.write("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY") is not None)
+st.write("CLAUDE_API_KEY:", os.getenv("CLAUDE_API_KEY") is not None)
 
 
 def safe_md(text: str) -> str:
