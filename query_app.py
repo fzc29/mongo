@@ -53,11 +53,11 @@ st.set_page_config(
     layout="wide"
 )
 
-st.write("APP STARTED")
-st.write("MONGO_URI_USER:", os.getenv("MONGO_URI_USER") is not None)
-st.write("MONGO_URI_ADMIN:", os.getenv("MONGO_URI_ADMIN") is not None)
-st.write("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY") is not None)
-st.write("CLAUDE_API_KEY:", os.getenv("CLAUDE_API_KEY") is not None)
+# st.write("APP STARTED")
+# st.write("MONGO_URI_USER:", os.getenv("MONGO_URI_USER") is not None)
+# st.write("MONGO_URI_ADMIN:", os.getenv("MONGO_URI_ADMIN") is not None)
+# st.write("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY") is not None)
+# st.write("CLAUDE_API_KEY:", os.getenv("CLAUDE_API_KEY") is not None)
 
 # -------------------------
 # Top Navigation Bar
