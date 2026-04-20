@@ -660,11 +660,54 @@ def _normalize_col(name: str) -> str:
     return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip("_")
 
 
-def _parse_pnl_markdown(path: Path) -> list[dict]:
-    """Parse a PnL markdown table into a list of row dicts."""
+def _parse_number(s: str) -> float | None:
+    """Parse a numeric string, stripping $, commas, parentheses for negatives."""
+    s = str(s).strip().replace("$", "").replace(",", "")
+    s = re.sub(r'^\((.+)\)$', r'-\1', s)  # (1234) → -1234
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_aum_summary(cells: list[str]) -> dict | None:
+    """
+    Extract start_aum, end_aum, total_pnl from the AUM summary row.
+    Row format: | Start AUM | 167820620.6 | End AUM | 175132642.6 | ... | Total PNL | | $7,312,022 | ...
+    """
+    summary = {}
+    for i, cell in enumerate(cells):
+        cl = cell.lower().strip()
+        if "start aum" in cl and i + 1 < len(cells):
+            v = _parse_number(cells[i + 1])
+            if v is not None:
+                summary["start_aum"] = v
+        elif "end aum" in cl and i + 1 < len(cells):
+            v = _parse_number(cells[i + 1])
+            if v is not None:
+                summary["end_aum"] = v
+        elif "total pnl" in cl:
+            # value may be 1-2 cells away (some formats have an empty cell between)
+            for j in range(i + 1, min(i + 3, len(cells))):
+                v = _parse_number(cells[j])
+                if v is not None:
+                    summary["total_pnl"] = v
+                    break
+
+    if "start_aum" in summary and "end_aum" in summary:
+        start, end = summary["start_aum"], summary["end_aum"]
+        if start > 0:
+            summary["return_pct"] = round((end - start) / start * 100, 4)
+
+    return summary if summary else None
+
+
+def _parse_pnl_markdown(path: Path) -> tuple[list[dict], dict | None]:
+    """Parse a PnL markdown table into (row_dicts, aum_summary | None)."""
     text = convert_excel_dates(path.read_text(encoding="utf-8"))
     rows = []
     header = None
+    summary = None
 
     for line in text.splitlines():
         line = line.strip()
@@ -681,8 +724,9 @@ def _parse_pnl_markdown(path: Path) -> list[dict]:
             header = [_normalize_col(c) for c in cells]
             continue
 
-        # Skip totals/AUM summary row
+        # Capture AUM/summary row instead of skipping it
         if cells and re.search(r'\baum\b', cells[0], re.I):
+            summary = _extract_aum_summary(cells)
             continue
 
         if header:
@@ -690,23 +734,31 @@ def _parse_pnl_markdown(path: Path) -> list[dict]:
             if any(v.strip() for v in row.values()):
                 rows.append(row)
 
-    return rows
+    return rows, summary
 
 
-def _parse_pnl_csv(path: Path) -> list[dict]:
-    """Parse a PnL CSV file into a list of row dicts."""
+def _parse_pnl_csv(path: Path) -> tuple[list[dict], dict | None]:
+    """Parse a PnL CSV file into (row_dicts, aum_summary | None)."""
     import csv as _csv
     rows = []
+    summary = None
     with open(path, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM
         reader = _csv.DictReader(f)
         for row in reader:
             clean = {_normalize_col(k): convert_excel_dates(str(v).strip())
                      for k, v in row.items() if k}
-            if re.search(r'\baum\b', " ".join(clean.keys()), re.I):
+            row_keys = " ".join(clean.keys())
+            if re.search(r'\baum\b', row_keys, re.I):
+                # Build a flat cell list for the summary extractor
+                cells = []
+                for k, v in row.items():
+                    cells.append(k or "")
+                    cells.append(v or "")
+                summary = _extract_aum_summary(cells)
                 continue
             if any(v.strip() for v in clean.values()):
                 rows.append(clean)
-    return rows
+    return rows, summary
 
 
 def ingest_pnl_structured(
@@ -749,9 +801,9 @@ def ingest_pnl_structured(
 
     ext = path.suffix.lower()
     if ext == ".md":
-        rows = _parse_pnl_markdown(path)
+        rows, aum_summary = _parse_pnl_markdown(path)
     elif ext == ".csv":
-        rows = _parse_pnl_csv(path)
+        rows, aum_summary = _parse_pnl_csv(path)
     else:
         raise ValueError(f"Unsupported file type: {ext}. Use .md or .csv")
 
@@ -768,12 +820,29 @@ def ingest_pnl_structured(
 
     col.insert_many(rows)
     print(f"  Inserted {len(rows)} rows into pnl_table for {report_period}")
+
+    # Store AUM summary for accurate return calculation
+    if aum_summary:
+        summary_col = get_collection("pnl_summary")
+        summary_col.delete_many({"report_period": report_period})  # replace if exists
+        summary_col.insert_one({
+            **aum_summary,
+            "report_period": report_period,
+            "source_file": display_name,
+            "uploaded_by": uploaded_by,
+            "uploaded_at": now,
+        })
+        ret = aum_summary.get("return_pct")
+        print(f"  Stored AUM summary: start={aum_summary.get('start_aum'):,.0f}  "
+              f"end={aum_summary.get('end_aum'):,.0f}  "
+              f"return={ret:+.2f}%" if ret is not None else "  Stored AUM summary (return_pct not computed)")
+
     return len(rows)
 
 
 def delete_pnl_period(report_period: str, dry_run: bool = False) -> int:
     """
-    Delete all rows for a specific PnL reporting period from pnl_table.
+    Delete all rows for a specific PnL reporting period from pnl_table and pnl_summary.
 
     Usage:
         delete_pnl_period("2026-02")
@@ -789,8 +858,24 @@ def delete_pnl_period(report_period: str, dry_run: bool = False) -> int:
         print("  DRY RUN — nothing deleted.")
         return count
     col.delete_many({"report_period": report_period})
-    print(f"  Deleted {count} rows.")
+    get_collection("pnl_summary").delete_many({"report_period": report_period})
+    print(f"  Deleted {count} rows (+ summary).")
     return count
+
+
+def get_pnl_summary(report_period: str) -> dict | None:
+    """
+    Return the pre-computed AUM summary for a period, or None if not stored.
+    Keys: start_aum, end_aum, total_pnl, return_pct, report_period
+
+    Usage:
+        s = get_pnl_summary("2026-02")
+        if s:
+            print(f"Return: {s['return_pct']:+.2f}%")
+    """
+    col = get_collection("pnl_summary")
+    doc = col.find_one({"report_period": report_period}, {"_id": 0})
+    return doc
 
 
 def backfill_report_periods(collection_name: str = "context_vectors") -> int:
